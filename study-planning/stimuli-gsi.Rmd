@@ -1,0 +1,346 @@
+---
+title: "Stimuli"
+author: "Alex Kale"
+date: "10/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(gganimate)
+library(RColorBrewer)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Synthetic data
+
+```{r}
+# set up grid of data conditions
+first_year <- 1990
+last_year <- 2015
+n_years <- last_year - first_year + 1
+mid_year <- first_year + n_years / 2
+
+df <- expand_grid(
+  "year" = seq(first_year, last_year, length.out = n_years),
+  "intercept" = 100,
+  "ref_slope" = 1,
+  "target_slope_diff" = seq(0, 1, length.out = 5),
+  "sd" = seq(1, 10, length.out = 4)#,
+  # "axis_limits" = list(c(60, 140), c(20, 180)) 
+  # "scale" = c(1, 2)
+)
+
+# head(df)
+```
+
+```{r}
+# generate target line, 95% CI of reference distribution, and draws from reference 
+n_draws <- 50
+
+df = df %>%
+  mutate(
+    # target line
+    target = intercept + (ref_slope + target_slope_diff) * (year - mid_year) + sd * map_dbl(year, ~rnorm(1)),
+    # confidence interval for reference distribution
+    ref_avg = intercept + ref_slope * (year - mid_year),
+    ref_lb = intercept + ref_slope * (year - mid_year) + qnorm(0.025, mean = 0, sd = sd),
+    ref_ub = intercept + ref_slope * (year - mid_year) + qnorm(0.975, mean = 0, sd = sd),
+    # draws from reference distribution
+    draw = list(seq(1, n_draws, length.out = n_draws)),
+  ) %>%
+  unnest(cols = c("draw")) %>%
+  mutate(
+    # compute reference lines
+    noise = sd * map_dbl(draw, ~rnorm(1)),
+    ref = intercept + (ref_slope) * (year - mid_year) + noise
+  )
+
+head(df)
+```
+
+Possible stimuli
+
+```{r}
+# no reference uncertainty
+df %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = ref_avg)) +
+  geom_line(aes(y = target), color = "red") +
+  theme_minimal() +
+  facet_grid(sd ~ target_slope_diff)
+```
+
+```{r}
+# envelope of reference uncertainty
+df %>%
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = ref_lb, ymax = ref_ub), fill = "gray", alpha = 0.5) +
+  geom_line(aes(y = target), color = "red") +
+  theme_minimal() +
+  facet_grid(sd ~ target_slope_diff)
+```
+
+```{r}
+# static ensemble of reference uncertainty
+df %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = ref, group = draw), alpha = .15, color = "gray", show.legend = FALSE) +
+  geom_line(aes(y = target), color = "red") +
+  theme_minimal() +
+  facet_grid(sd ~ target_slope_diff)
+```
+
+```{r}
+# HOPs of reference uncertainty
+plt_spec <- df %>%
+  ggplot(aes(x = year)) +
+  geom_line(aes(y = target), color = "red") +
+  geom_line(aes(y = ref), alpha = .5, color = "gray", show.legend = FALSE) +
+  theme_minimal() +
+  facet_grid(sd ~ target_slope_diff) +
+  transition_manual(draw)
+
+animate(plt_spec, fps = 2.5, duration = 20)
+```
+
+Discrepancy functions. We assume that slope is the fundamental visual test statistic for comparing trends. In actuality, the test statistic could be average value on the y-axis, range on the y-axis, or any number of correlated proxies. The perceptual proxy for comparison is unimportant to us. The way these proxies are used to construct different forms of visual statistical test is our primary concern.
+
+```{r}
+# slope function (visual test statistic)
+# (expects vectors of cartesian coordinates)
+slope <- function(x, y) {
+  # lagged differences
+  dx <- diff(x)
+  dy <- diff(y)
+  
+  return(mean(dy / dx))
+}
+```
+
+```{r}
+# normalization to match scale of discrepancy functions
+normalize <- function(signal) {
+  return(signal / (max(signal) - min(signal)))
+}
+```
+
+```{r}
+# slope difference 
+# (expects single reference vector, e.g., avg of ensemble)
+slope_diff <- function(x, target, reference) {
+  slope_target <- slope(x, target)
+  slope_reference <- slope(x, reference)
+  
+  return(slope_target - slope_reference)
+}
+```
+
+```{r}
+# normalized slope difference 
+# (expects single reference vector, e.g., avg of ensemble)
+# (lb and ub could be from reference distribution or axis)
+normalized_slope_diff <- function(x, target, reference, lb, ub) {
+  # numerator is slope difference (as before)
+  slope_discrepancy <- slope_diff(x, target, reference)
+  # denominator is maximum slope within boundaries provided
+  slope_max <- (ub - lb) / (max(x) - min(x))
+  
+  return(slope_discrepancy / slope_max)
+}
+
+```
+
+```{r}
+# proportion not contained
+# (expects single reference vectors, e.g., min and max of ensemble)
+proportion_not_contained <- function(target, reference_lb, reference_ub) {
+  # discrepancy is how much of target falls outside of reference range
+  return(sum(target < reference_lb || target > reference_ub) / length(target))
+}
+```
+
+```{r}
+# percentile within ensemble as an approximation of likelihood
+# (expects list of reference draws at each x value, e.g., an ensemble)
+percentile <- function(x, target, reference) {
+  # calculate slopes for target and reference distribution
+  slope_target <- slope(x, target)
+  slopes_ref <- c()
+  for(i in 1:length(reference[[1]])) { # iterate over draws calculating slopes for each
+    draw_ref = unlist(map(reference, ~.[[i]]))
+    slopes_ref = append(slopes_ref, slope(x, draw_ref))
+  }
+  # function for percentile of target within reference
+  pr <- ecdf(slopes_ref)
+  
+  return(pr(slope_target))
+}
+```
+
+```{r}
+# likelihood-based t-test
+# (expects list of reference draws at each x value, e.g., an ensemble)
+t_test <- function(x, target, reference) {
+  # calculate slopes for target and reference distribution
+  slope_target <- slope(x, target)
+  slopes_ref <- c()
+  for(i in 1:length(reference[[1]])) { # iterate over draws calculating slopes for each
+    draw_ref = unlist(map(reference, ~.[[i]]))
+    slopes_ref = append(slopes_ref, slope(x, draw_ref))
+  }
+  # calculate mean and sampling error for slopes based on reference distribution
+  slopes_ref_avg <- mean(slopes_ref)
+  slopes_ref_var <- var(slopes_ref)
+  n <- length(slopes_ref)
+  se <- sqrt(slopes_ref_var / n)
+  # calculate t statistics (expresses likelihood)
+  t <- (slope_target - slopes_ref_avg) / se
+  
+  return(t)
+}
+```
+
+Pass each data condition through these discrepancy functions to generate possible interpretations. Generate interpretations separately for each type of uncertainty visualization.
+
+Set up consistent color scale.
+
+```{r echo=FALSE}
+# need a consistent color scale for these heuristics
+discrepancy_function <- as.factor(c("slope_difference", "shortaxis_normalized_slope_difference", "tallaxis_normalized_slope_difference", "range_normalized_slope_difference", "proportion_not_contained", "percentile", "t_test"))
+hColors <- brewer.pal(length(discrepancy_function), "Set1")
+names(hColors) <- levels(discrepancy_function)
+colScale <- scale_colour_manual(values = hColors)
+```
+
+When we don't visualize reference uncertainty.
+
+```{r}
+df %>% 
+  group_by(target_slope_diff, sd) %>%
+  summarise(
+    # inputs
+    year = unique(year),
+    target = unique(target),
+    ref_avg = unique(ref_avg),
+    # discrepancy functions
+    g_slope_difference = slope_diff(year, target, ref_avg),
+    g_shortaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 60, 140),
+    g_tallaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 20, 180)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # normalize signal from each discrepancy function to match scales
+    g_slope_difference = normalize(g_slope_difference)#,
+    # g_shortaxis_normalized_slope_difference = normalize(g_shortaxis_normalized_slope_difference),
+    # g_tallaxis_normalized_slope_difference = normalize(g_tallaxis_normalized_slope_difference)
+  ) %>%
+  pivot_longer(
+    cols = starts_with("g_"),
+    names_to = "discrepancy_function",
+    names_prefix = "g_",
+    values_to = "signal",
+    values_drop_na = TRUE
+  ) %>%
+  ggplot(aes(x = target_slope_diff, y = signal, color = discrepancy_function)) +
+  geom_line() +
+  colScale +
+  theme_minimal() +
+  facet_grid(sd ~ .)
+```
+
+When we visualize an envelope of reference uncertainty.
+
+```{r}
+df %>% 
+  group_by(target_slope_diff, sd) %>%
+  summarise(
+    # inputs
+    year = unique(year),
+    target = unique(target),
+    ref_avg = unique(ref_avg),
+    ref_lb = unique(ref_lb),
+    ref_ub = unique(ref_ub),
+    # discrepancy functions
+    g_slope_difference = slope_diff(year, target, ref_avg),
+    g_shortaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 60, 140),
+    g_tallaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 20, 180),
+    g_range_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, min(ref_lb), max(ref_ub)),
+    g_proportion_not_contained = proportion_not_contained(target, ref_lb, ref_ub)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # normalize signal from each discrepancy function to match scales
+    g_slope_difference = normalize(g_slope_difference),
+    # g_shortaxis_normalized_slope_difference = normalize(g_shortaxis_normalized_slope_difference),
+    # g_tallaxis_normalized_slope_difference = normalize(g_tallaxis_normalized_slope_difference),
+    # g_range_normalized_slope_difference = normalize(g_range_normalized_slope_difference),
+    g_proportion_not_contained = normalize(g_proportion_not_contained)
+  ) %>%
+  pivot_longer(
+    cols = starts_with("g_"),
+    names_to = "discrepancy_function",
+    names_prefix = "g_",
+    values_to = "signal",
+    values_drop_na = TRUE
+  ) %>%
+  ggplot(aes(x = target_slope_diff, y = signal, color = discrepancy_function)) +
+  geom_line() +
+  colScale +
+  theme_minimal() +
+  facet_grid(sd ~ .)
+```
+
+When we visualize an ensemble of reference uncertainty (static ensemble or HOPs).
+
+```{r}
+df %>% 
+  # for ensembles, we define inputs to discrepancy functions based on ensemble processing rather than direct value decoding
+  group_by(target_slope_diff, sd, year) %>%
+  summarise(
+    # inputs
+    target = unique(target),
+    ref_avg = mean(ref),
+    ref_lb = min(ref),
+    ref_ub = max(ref),
+    draw = list(draw),
+    ref = list(ref)
+  ) %>%
+  mutate(
+    # discrepancy functions
+    g_slope_difference = slope_diff(year, target, ref_avg),
+    g_shortaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 60, 140),
+    g_tallaxis_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, 20, 180),
+    g_range_normalized_slope_difference = normalized_slope_diff(year, target, ref_avg, min(ref_lb), max(ref_ub)),
+    g_proportion_not_contained = proportion_not_contained(target, ref_lb, ref_ub),
+    g_percentile = percentile(year, target, ref),
+    g_t_test = t_test(year, target, ref)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # normalize signal from each discrepancy function to match scales
+    g_slope_difference = normalize(g_slope_difference),
+    # g_shortaxis_normalized_slope_difference = normalize(g_shortaxis_normalized_slope_difference),
+    # g_tallaxis_normalized_slope_difference = normalize(g_tallaxis_normalized_slope_difference),
+    # g_range_normalized_slope_difference = normalize(g_range_normalized_slope_difference),
+    g_proportion_not_contained = normalize(g_proportion_not_contained),
+    g_percentile = normalize(g_percentile),
+    g_t_test = normalize(g_t_test)
+  ) %>%
+  pivot_longer(
+    cols = starts_with("g_"),
+    names_to = "discrepancy_function",
+    names_prefix = "g_",
+    values_to = "signal",
+    values_drop_na = TRUE
+  ) %>%
+  ggplot(aes(x = target_slope_diff, y = signal, color = discrepancy_function)) +
+  geom_line() +
+  colScale +
+  theme_minimal() +
+  facet_grid(sd ~ .)
+```
